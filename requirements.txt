@@ -1,0 +1,12 @@
+# Base dependencies (install with: pip install -r requirements.txt)
+torch
+numpy
+transformers
+datasets
+tiktoken
+wandb
+tqdm
+
+# Optional: FlashAttention-2 kernels (requires Linux + CUDA, Ampere-or-newer GPU)
+# Uncomment the line below and install if you have compatible hardware:
+# flash-attn

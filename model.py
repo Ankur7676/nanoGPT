@@ -15,6 +15,30 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+try:
+    from flash_attn import flash_attn_func
+    FLASH_ATTN_AVAILABLE = True
+except ImportError:
+    FLASH_ATTN_AVAILABLE = False
+
+def _alibi_slopes(n_head):
+    """
+    Per-head ALiBi slopes (Press et al. 2021, https://arxiv.org/abs/2108.12409).
+    Reference implementation: https://github.com/ofirpress/attention_with_linear_biases
+    """
+    def slopes_power_of_2(n):
+        start = 2 ** (-(2 ** -(math.log2(n) - 3)))
+        return [start * (start ** i) for i in range(n)]
+    if math.log2(n_head).is_integer():
+        slopes = slopes_power_of_2(n_head)
+    else:
+        closest_power_of_2 = 2 ** math.floor(math.log2(n_head))
+        slopes = slopes_power_of_2(closest_power_of_2)
+        extra = slopes_power_of_2(2 * closest_power_of_2)[0::2][:n_head - closest_power_of_2]
+        slopes = slopes + extra
+    return torch.tensor(slopes, dtype=torch.float32)
+
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -25,6 +49,7 @@ class LayerNorm(nn.Module):
 
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+
 
 class CausalSelfAttention(nn.Module):
 
@@ -75,6 +100,96 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
+
+class FlashAttention(nn.Module):
+    """
+    Causal self-attention using the flash-attn package's FlashAttention-2 CUDA kernels.
+    Adds causal sliding-window attention and ALiBi positional bias, which torch's
+    scaled_dot_product_attention does not expose. Falls back to SDPA -- with the same
+    window/alibi masking applied by hand -- when flash-attn isn't installed or the GPU
+    is older than Ampere (flash-attn requires compute capability >= 8.0).
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+        self.window_size = config.window_size
+        self.alibi = config.alibi
+        self.deterministic = config.flash_attn_deterministic
+
+        self.use_flash_kernel = (
+            FLASH_ATTN_AVAILABLE
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability()[0] >= 8
+        )
+        if not self.use_flash_kernel:
+            reason = "flash-attn is not installed" if not FLASH_ATTN_AVAILABLE else "GPU is older than Ampere (needs compute capability >= 8.0)"
+            print(f"WARNING: FlashAttention kernels unavailable ({reason}); "
+                  f"falling back to SDPA with equivalent window/alibi masking")
+
+        if self.alibi:
+            self.register_buffer("alibi_slopes", _alibi_slopes(config.n_head), persistent=False)
+        else:
+            self.alibi_slopes = None
+
+    def _sdpa_fallback(self, q, k, v, T):
+        # q, k, v: (B, nh, T, hs). Builds an additive mask combining the causal
+        # constraint, the sliding window, and (optionally) the ALiBi bias.
+        device, dtype = q.device, q.dtype
+        i = torch.arange(T, device=device).view(T, 1)
+        j = torch.arange(T, device=device).view(1, T)
+        allowed = j <= i
+        if self.window_size >= 0:
+            allowed = allowed & ((i - j) <= self.window_size)
+        attn_mask = torch.zeros(T, T, device=device, dtype=dtype)
+        attn_mask.masked_fill_(~allowed, float('-inf'))
+        if self.alibi:
+            distance = (i - j).to(dtype)
+            bias = -self.alibi_slopes.to(device=device, dtype=dtype).view(-1, 1, 1) * distance
+            attn_mask = attn_mask.unsqueeze(0) + bias  # (nh, T, T), broadcasts over batch
+        return F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask,
+            dropout_p=self.dropout if self.training else 0,
+            is_causal=False,
+        )
+
+    def forward(self, x):
+        B, T, C = x.size()
+        head_dim = C // self.n_head
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+
+        if self.use_flash_kernel:
+            # flash_attn_func wants (B, T, nh, hs), unlike SDPA's (B, nh, T, hs)
+            q = q.view(B, T, self.n_head, head_dim)
+            k = k.view(B, T, self.n_head, head_dim)
+            v = v.view(B, T, self.n_head, head_dim)
+            window = (self.window_size, 0) if self.window_size >= 0 else (-1, -1)
+            alibi_slopes = self.alibi_slopes.to(device=q.device) if self.alibi else None
+            y = flash_attn_func(
+                q, k, v,
+                dropout_p=self.dropout if self.training else 0.0,
+                causal=True,
+                window_size=window,
+                alibi_slopes=alibi_slopes,
+                deterministic=self.deterministic,
+            )
+            y = y.contiguous().view(B, T, C)
+        else:
+            q = q.view(B, T, self.n_head, head_dim).transpose(1, 2)
+            k = k.view(B, T, self.n_head, head_dim).transpose(1, 2)
+            v = v.view(B, T, self.n_head, head_dim).transpose(1, 2)
+            y = self._sdpa_fallback(q, k, v, T)
+            y = y.transpose(1, 2).contiguous().view(B, T, C)
+
+        return self.resid_dropout(self.c_proj(y))
+
+
 class MLP(nn.Module):
 
     def __init__(self, config):
@@ -91,12 +206,13 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
+
 class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
+        self.attn = FlashAttention(config) if config.use_flash_attn else CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
@@ -104,6 +220,7 @@ class Block(nn.Module):
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
+
 
 @dataclass
 class GPTConfig:
@@ -114,6 +231,11 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    use_flash_attn: bool = False # use the flash-attn package's FlashAttention-2 CUDA kernels instead of SDPA
+    window_size: int = -1 # causal sliding-window span in tokens (how far back a query may attend); -1 = unlimited
+    alibi: bool = False # add an ALiBi positional bias to attention scores (Press et al. 2021)
+    flash_attn_deterministic: bool = False # trade speed for a bitwise-deterministic backward pass (flash-attn only)
+
 
 class GPT(nn.Module):
 

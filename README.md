@@ -31,6 +31,7 @@ Dependencies:
 -  `tiktoken` for OpenAI's fast BPE code <3
 -  `wandb` for optional logging <3
 -  `tqdm` for progress bars <3
+-  `flash-attn` (optional) for FlashAttention-2 CUDA kernels -- needs Linux + CUDA on an Ampere-or-newer GPU; the model automatically falls back to PyTorch's SDPA if it's missing <3
 
 ## quick start
 
@@ -207,6 +208,8 @@ If you'd like to sample from a model you trained, use the `--out_dir` to point t
 For simple model benchmarking and profiling, `bench.py` might be useful. It's identical to what happens in the meat of the training loop of `train.py`, but omits much of the other complexities.
 
 Note that the code by default uses [PyTorch 2.0](https://pytorch.org/get-started/pytorch-2.0/). At the time of writing (Dec 29, 2022) this makes `torch.compile()` available in the nightly release. The improvement from the one line of code is noticeable, e.g. cutting down iteration time from ~250ms / iter to 135ms / iter. Nice work PyTorch team!
+n
+If you have an Ampere-or-newer NVIDIA GPU on Linux, `pip install flash-attn` and set `use_flash_attn = True` in your config (see [config/train_flash_attn.py](config/train_flash_attn.py)) to use FlashAttention-2 kernels, which also unlock causal sliding-window attention (`window_size`) and an ALiBi positional bias (`alibi`). Without flash-attn installed, or on unsupported hardware, the model prints a warning and automatically falls back to `torch.nn.functional.scaled_dot_product_attention` with equivalent masking -- `use_flash_attn=True` is always safe to leave on. Compare the two paths with `python benchmarks/bench_flash_attn.py`.
 
 ## todos
 
